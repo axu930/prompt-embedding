@@ -23,14 +23,14 @@ class LlamaModel(nn.Module):
         self.norm = LlamaRMSNorm(config.n_embd)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-        freqs_cis = precompute_freqs_cis(dim=config.n_embd, end=config.block_size, theta=config.rope_theta)
+        freqs_cis = precompute_freqs_cis(dim=config.head_dim, end=config.block_size, theta=config.rope_theta)
         mask = (torch.arange(config.block_size)[:,None] - torch.arange(config.block_size)[None,:] >= 0) 
 
         self.register_buffer('freqs_cis', freqs_cis, persistent=False)
         self.register_buffer("mask",torch.where(mask,0,float('-inf')), persistent=False)
 
     def forward(self,
-                toks: torch.Tensor
+                toks: torch.Tensor,
                 ) -> torch.Tensor:
         _, T = toks.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
@@ -43,8 +43,25 @@ class LlamaModel(nn.Module):
 
         return logits
     
+    @torch.no_grad()
+    def generate(self,
+                 toks: torch.Tensor,
+                 top_k: int = 50,
+                 temperature: float = 1.0,
+                 ) -> torch.Tensor:
+        assert temperature > 0, "Temperature needs to be positive"
+        assert top_k >= 1, "top_k needs to be at least 1"
+
+        logits = self.forward(toks[:,:self.config.block_size])[:,-1,:] / temperature
+        k_val, k_ind = torch.topk(logits, k=top_k, dim=-1)
+        probs = F.softmax(k_val, dim=-1)
+        toks_next = torch.multinomial(probs,num_samples=1)
+        toks = torch.cat(toks_next)
+        return toks
+
+    
     @classmethod
-    def from_pretrained(cls, config):
+    def from_huggingface(cls, config):
         from transformers import AutoModelForCausalLM
 
         model = LlamaModel(config)
@@ -53,12 +70,15 @@ class LlamaModel(nn.Module):
 
         model_hf = AutoModelForCausalLM.from_pretrained(config.modelpath)
         sd_hf = model_hf.state_dict()
-        sd_hf_keys = sd_hf.keys()
 
-        for k in sd_hf_keys:
-            if k in sd_keys:
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
+        for k in sd_keys:
+            with torch.no_grad():
+                # lm head weights are stored in a separate location
+                if k == 'lm_head.weight':
+                    sd[k].copy_(model_hf.lm_head.weight)
+                else:
+                    hf_k = 'model.' + k
+                    sd[k].copy_(sd_hf[hf_k])
         print("Llama model loaded from state dict")
         return model
 
@@ -73,7 +93,7 @@ class AttentionOnlyLlamaModel(nn.Module):
         )
         self.norm = LlamaRMSNorm(config.n_embd)
         
-        freqs_cis = precompute_freqs_cis(dim=config.n_embd, end=config.block_size, theta=config.rope_theta)
+        freqs_cis = precompute_freqs_cis(dim=config.head_dim, end=config.block_size, theta=config.rope_theta)
         mask = (torch.arange(config.block_size)[:,None] - torch.arange(config.block_size)[None,:] >= 0) 
 
         self.register_buffer('freqs_cis', freqs_cis, persistent=False)
@@ -88,17 +108,33 @@ class AttentionOnlyLlamaModel(nn.Module):
 
         x = self.embed_tokens(toks)
         for layer in self.layers:
-            x = layer(x, self.freqs_cis[:T,:], self.mask[None,None,:T,:T])
+            x = layer(x, self.freqs_cis[:T,:], self.mask[:T,:T])
         x = self.norm(x)
         return x
     
     @classmethod
-    def from_pretrained(cls, config):
+    def from_huggingface(cls, config):
         from transformers import AutoModelForCausalLM
 
         model = AttentionOnlyLlamaModel(config)
-        model_hf = AutoModelForCausalLM.from_pretrained(config.modelpath)
+        sd = model.state_dict()
+        sd_keys = sd.keys()
 
+        model_hf = AutoModelForCausalLM.from_pretrained(config.modelpath)
+        sd_hf = model_hf.state_dict()
+
+        for k in sd_keys:
+            if k.startswith("layers."):
+                with torch.no_grad():
+                    hf_k = k.split(".")
+                    hf_k = ['model'] + hf_k[:2] + ['self_attn'] + hf_k[2:]
+                    hf_k = ".".join(hf_k)
+                    sd[k].copy_(sd_hf[hf_k])
+            else:
+                with torch.no_grad():
+                    hf_k = 'model.' + k
+                    sd[k].copy_(sd_hf[hf_k])
+        print("Llama model loaded from state dict")
         return model
 
 
@@ -135,6 +171,7 @@ class LlamaSdpaAttention(nn.Module):
 
         self.n_heads = config.n_heads 
         self.n_kv_heads = config.n_kv_heads 
+        self.head_dim = config.head_dim
 
     def forward(self,
                 x: torch.Tensor,
@@ -147,18 +184,25 @@ class LlamaSdpaAttention(nn.Module):
         xk = self.k_proj(x)
         xv = self.v_proj(x)
 
-        # (bsz, n_sa_head, seq_len, qk_dim)
-        xq = xq.view(B, T, self.n_sa_head, self.qk_dim).transpose(1,2)  
-        xk = xk.view(B, T, self.n_sa_head, self.qk_dim).transpose(1,2)
-        xv = xv.view(B, T, self.n_sa_head, self.v_dim).transpose(1,2)  
+        # (bsz, n_head, seq_len, head_dim)
+        xq = xq.view(B, T, self.n_heads, self.head_dim).transpose(1,2)  
+        xk = xk.view(B, T, self.n_kv_heads, self.head_dim).transpose(1,2)
+        xv = xv.view(B, T, self.n_kv_heads, self.head_dim).transpose(1,2)   
 
         # Apply rotary proj here
+        
+        print(attention_mask.shape)
+        print(xq.shape)
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
+        print(xq.shape)
 
-        qk_matrix = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.qk_dim) + attention_mask # (bsz, n_sa_head, seq_len, seq_len)
+        qk_matrix = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim) 
+        print(qk_matrix.shape)
+
+        qk_matrix = qk_matrix + attention_mask[None, None, :, :] 
         qk_matrix = F.softmax(qk_matrix, dim=-1)
 
-        x = (qk_matrix @ xv).transpose(1,2).contiguous().view(B, T, self.n_sa_head * self.v_dim) # (bsz, seq_len, n_sa_head * v_dim)
+        x = (qk_matrix @ xv).transpose(1,2).contiguous().view(B, T, self.n_heads * self.head_dim) 
         return self.o_proj(x)
     
 
@@ -217,6 +261,6 @@ def apply_rotary_emb(
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
     freqs_cis = freqs_cis[:, None, :]
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(2)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(2)
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(-2)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(-2)
     return xq_out.type_as(xq), xk_out.type_as(xk)
