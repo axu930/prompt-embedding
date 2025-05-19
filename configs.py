@@ -27,6 +27,7 @@ class Llama3BConfig:
 
 
 # meta-llama/Llama-3.2-1B
+# 1 498 482 688 with MLP, 430 442 496 without
 @dataclass
 class Llama1BConfig:
     modelpath:  str = "meta-llama/Llama-3.2-1B-Instruct"
@@ -41,5 +42,5 @@ class Llama1BConfig:
     n_kv_heads: int = 8      # number kv heads
     head_dim:   int = 64     # channels per head
 
-    rope_theta: float = 500000.0 # theta value 
+    rope_theta: float = 10000.0 # theta value 
 

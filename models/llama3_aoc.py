@@ -9,7 +9,7 @@ import math
 # Llama model code: https://github.com/meta-llama/llama/blob/main/llama/model.py
 # See also: https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py
 
-# Models
+# Reproduction of Llama3.2, to be used as the decoder
 class LlamaModel(nn.Module):
 
     def __init__(self, config):
@@ -46,17 +46,20 @@ class LlamaModel(nn.Module):
     @torch.no_grad()
     def generate(self,
                  toks: torch.Tensor,
+                 num_steps: int,
                  top_k: int = 50,
-                 temperature: float = 1.0,
+                 temperature: float = 0.6,
                  ) -> torch.Tensor:
         assert temperature > 0, "Temperature needs to be positive"
         assert top_k >= 1, "top_k needs to be at least 1"
 
-        logits = self.forward(toks[:,:self.config.block_size])[:,-1,:] / temperature
-        k_val, k_ind = torch.topk(logits, k=top_k, dim=-1)
-        probs = F.softmax(k_val, dim=-1)
-        toks_next = torch.multinomial(probs,num_samples=1)
-        toks = torch.cat(toks_next)
+        for _ in range(num_steps):
+            logits = self.forward(toks[:,:self.config.block_size])[:,-1,:] / temperature
+            k_val, k_ind = torch.topk(logits, k=top_k, dim=-1)
+            probs = F.softmax(k_val, dim=-1)
+            sampled_idx = torch.multinomial(probs,num_samples=1)
+            toks_next = torch.gather(k_ind, -1, sampled_idx)
+            toks = torch.cat([toks,toks_next], dim=-1)
         return toks
 
     
@@ -72,6 +75,7 @@ class LlamaModel(nn.Module):
         sd_hf = model_hf.state_dict()
 
         for k in sd_keys:
+            print(k)
             with torch.no_grad():
                 # lm head weights are stored in a separate location
                 if k == 'lm_head.weight':
@@ -83,6 +87,7 @@ class LlamaModel(nn.Module):
         return model
 
 
+# Llama 3.2 model with no MLPs, to be used as the encoder
 class AttentionOnlyLlamaModel(nn.Module):
 
     def __init__(self, config):
@@ -172,6 +177,7 @@ class LlamaSdpaAttention(nn.Module):
         self.n_heads = config.n_heads 
         self.n_kv_heads = config.n_kv_heads 
         self.head_dim = config.head_dim
+        self.n_rep = config.n_heads // config.n_kv_heads
 
     def forward(self,
                 x: torch.Tensor,
@@ -179,27 +185,25 @@ class LlamaSdpaAttention(nn.Module):
                 attention_mask: torch.Tensor,
                 ):
         B, T, C = x.size()
-
         xq = self.q_proj(x)
         xk = self.k_proj(x)
         xv = self.v_proj(x)
 
-        # (bsz, n_head, seq_len, head_dim)
-        xq = xq.view(B, T, self.n_heads, self.head_dim).transpose(1,2)  
-        xk = xk.view(B, T, self.n_kv_heads, self.head_dim).transpose(1,2)
-        xv = xv.view(B, T, self.n_kv_heads, self.head_dim).transpose(1,2)   
+        # Reshape (bsz, n_head/n_kv_head, seq_len, head_dim)
+        xq = xq.view(B, T, self.n_heads, self.head_dim)
+        xk = xk.view(B, T, self.n_kv_heads, self.head_dim)
+        xv = xv.view(B, T, self.n_kv_heads, self.head_dim)
 
-        # Apply rotary proj here
-        
-        print(attention_mask.shape)
-        print(xq.shape)
+        # Apply rotary proj  
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
-        print(xq.shape)
 
-        qk_matrix = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim) 
-        print(qk_matrix.shape)
+        # Transpose and repeat kv if there are more heads than kv heads
+        xq = xq.transpose(1,2)  
+        xk = repeat_kv(xk, self.n_rep).transpose(1,2)  
+        xv = repeat_kv(xv, self.n_rep).transpose(1,2)  
 
-        qk_matrix = qk_matrix + attention_mask[None, None, :, :] 
+        # Apply attn
+        qk_matrix = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim) + attention_mask[None, None, :, :] 
         qk_matrix = F.softmax(qk_matrix, dim=-1)
 
         x = (qk_matrix @ xv).transpose(1,2).contiguous().view(B, T, self.n_heads * self.head_dim) 
@@ -213,36 +217,34 @@ class LlamaMLP(nn.Module):
         self.gate_proj = nn.Linear(config.n_embd, config.int_size, bias=False)
         self.up_proj = nn.Linear(config.n_embd, config.int_size, bias=False)
         self.down_proj = nn.Linear(config.int_size, config.n_embd, bias = False)
-        self.act_fn = nn.SiLU()
 
     def forward(
             self,
             x: torch.Tensor, 
             ):
-        x = self.down_proj(self.act_fn(self.gate_proj(x) * self.up_proj(x)))
-        return x
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
     
 
 # Huggingface implementation of RMS norm and rotary embedding
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py
 class LlamaRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-5):
+    def __init__(self, dim, eps=1e-5):
         """
         LlamaRMSNorm is equivalent to T5LayerNorm
         """
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(
             self, 
-            hidden_states
+            x: torch.Tensor,
             ):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
 
 
 
@@ -260,7 +262,20 @@ def apply_rotary_emb(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis[:, None, :]
+    freqs_cis = freqs_cis[None, :, None, :]
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(-2)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(-2)
     return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
+# Since there are more q heads than kv heads
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
+    bs, slen, n_kv_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    return (
+        x[:, :, :, None, :]
+        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
+        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
+    )
